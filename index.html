@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<head>
+    <title>Real-Time Task Management System</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Inter Font -->
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7f9fb;
+        }
+        .task-done {
+            text-decoration: line-through;
+            color: #9ca3af; /* gray-400 */
+        }
+    </style>
+</head>
+<body class="min-h-screen p-4 sm:p-8">
+
+    <div id="app" class="max-w-3xl mx-auto">
+        <header class="text-center mb-8">
+            <h1 class="text-4xl font-extrabold text-gray-900 mb-2 tracking-tight">
+                Real-Time Task Manager
+            </h1>
+            <p class="text-lg text-gray-600">Using JavaScript</p>
+            <p id="auth-status" class="text-xs text-indigo-500 mt-2 p-1 bg-indigo-50 rounded-lg inline-block"></p>
+        </header>
+
+        <!-- Task Input Form -->
+        <div class="bg-white p-6 rounded-xl shadow-lg mb-8">
+            <form id="task-form" class="flex flex-col sm:flex-row gap-3">
+                <input
+                    type="text"
+                    id="task-input"
+                    placeholder="Enter a new task..."
+                    required
+                    class="flex-grow p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 text-gray-800 transition duration-150"
+                />
+                <button
+                    type="submit"
+                    id="add-task-btn"
+                    class="px-6 py-3 bg-indigo-600 text-white font-semibold rounded-lg hover:bg-indigo-700 transition duration-150 shadow-md hover:shadow-lg focus:outline-none focus:ring-4 focus:ring-indigo-500 focus:ring-opacity-50"
+                >
+                    Add Task
+                </button>
+            </form>
+        </div>
+
+        <!-- Task List Container -->
+        <div id="tasks-list" class="space-y-4">
+            <!-- Tasks will be rendered here -->
+            <div id="loading-indicator" class="text-center text-gray-500 p-8">Loading tasks...</div>
+        </div>
+
+    </div>
+
+    <!-- Firebase SDK Imports and Core Application Logic -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, addDoc, updateDoc, deleteDoc, onSnapshot, collection, query, orderBy, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // =========================================================================
+        // IMPORTANT: LOCAL DEVELOPMENT CONFIGURATION (Replace this with YOUR keys)
+        // If you are running this outside of the secure hosting environment (like VS Code Live Server),
+        // you MUST provide a valid Firebase Config JSON object here.
+        // Otherwise, leave it as null for the environment to inject it securely.
+        const LOCAL_FIREBASE_CONFIG = null; // Set this to your config object like: { apiKey: "...", authDomain: "...", ... }
+        // =========================================================================
+
+
+        // IMPORTANT: Global variables provided by the Canvas environment MUST be used
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        // Check if global config exists, otherwise use the local config for testing.
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : LOCAL_FIREBASE_CONFIG;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db, auth, userId = null;
+        const taskForm = document.getElementById('task-form');
+        const taskInput = document.getElementById('task-input');
+        const tasksList = document.getElementById('tasks-list');
+        const authStatus = document.getElementById('auth-status');
+        const loadingIndicator = document.getElementById('loading-indicator');
+
+        // Configure logging for debugging
+        setLogLevel('debug');
+
+        /**
+         * Converts base64 string to ArrayBuffer.
+         * Used for playing PCM audio.
+         * @param {string} base64 The base64 string.
+         * @returns {ArrayBuffer} The ArrayBuffer.
+         */
+        const base64ToArrayBuffer = (base64) => {
+            const binaryString = atob(base64);
+            const len = binaryString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            return bytes.buffer;
+        };
+
+        /**
+         * Converts PCM 16-bit audio data into a WAV Blob.
+         * @param {Int16Array} pcm16Data The raw PCM data.
+         * @param {number} sampleRate The sample rate (e.g., 24000).
+         * @returns {Blob} The WAV audio Blob.
+         */
+        const pcmToWav = (pcm16Data, sampleRate) => {
+            const numChannels = 1;
+            const bytesPerSample = 2; // 16-bit PCM
+
+            const buffer = new ArrayBuffer(44 + pcm16Data.length * bytesPerSample);
+            const view = new DataView(buffer);
+            let offset = 0;
+
+            // RIFF chunk
+            writeString('RIFF'); offset += 4;
+            view.setUint32(offset, 36 + pcm16Data.length * bytesPerSample, true); offset += 4;
+            writeString('WAVE'); offset += 4;
+
+            // fmt chunk
+            writeString('fmt '); offset += 4;
+            view.setUint32(offset, 16, true); offset += 4; // Chunk size
+            view.setUint16(offset, 1, true); offset += 2;  // Audio format (1 for PCM)
+            view.setUint16(offset, numChannels, true); offset += 2;
+            view.setUint32(offset, sampleRate, true); offset += 4;
+            view.setUint32(offset, sampleRate * numChannels * bytesPerSample, true); offset += 4; // Byte rate
+            view.setUint16(offset, numChannels * bytesPerSample, true); offset += 2; // Block align
+            view.setUint16(offset, 8 * bytesPerSample, true); offset += 2; // Bits per sample
+
+            // data chunk
+            writeString('data'); offset += 4;
+            view.setUint32(offset, pcm16Data.length * bytesPerSample, true); offset += 4;
+
+            // Write PCM data
+            for (let i = 0; i < pcm16Data.length; i++) {
+                view.setInt16(offset, pcm16Data[i], true); offset += 2;
+            }
+
+            return new Blob([buffer], { type: 'audio/wav' });
+
+            function writeString(s) {
+                for (let i = 0; i < s.length; i++) {
+                    view.setUint8(offset + i, s.charCodeAt(i));
+                }
+            }
+        };
+
+
+        // --- FIREBASE INITIALIZATION AND AUTHENTICATION ---
+
+        async function setupFirebaseAndAuth() {
+            if (!firebaseConfig) {
+                console.error("");
+                loadingIndicator.textContent = "";
+                return;
+            }
+
+            try {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                // Sign in the user using the provided token or anonymously
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                // Wait for auth state change to confirm user ID
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        authStatus.textContent = `User ID: ${userId.substring(0, 8)}... (Full ID: ${userId})`;
+                        loadTasks(); // Start loading data once authenticated
+                    } else {
+                        // This should ideally not happen if signInAnonymously is successful
+                        userId = null;
+                        authStatus.textContent = 'Signed out';
+                    }
+                });
+
+            } catch (error) {
+                console.error("Firebase setup failed:", error);
+                loadingIndicator.textContent = `Error during authentication: ${error.message}`;
+            }
+        }
+
+
+        // --- FIRESTORE CRUD OPERATIONS ---
+
+        function getCollectionRef() {
+            if (!db || !userId) {
+                console.error("Database or User ID is not ready.");
+                return null;
+            }
+            // Private data path: /artifacts/{appId}/users/{userId}/tasks
+            const collectionPath = `artifacts/${appId}/users/${userId}/tasks`;
+            return collection(db, collectionPath);
+        }
+
+        async function addTask(text) {
+            const collectionRef = getCollectionRef();
+            if (!collectionRef) return;
+
+            try {
+                await addDoc(collectionRef, {
+                    text: text.trim(),
+                    completed: false,
+                    createdAt: Date.now()
+                });
+                taskInput.value = ''; // Clear input on success
+            } catch (error) {
+                console.error("Error adding document: ", error);
+            }
+        }
+
+        async function toggleTask(taskId, isCompleted) {
+            const collectionRef = getCollectionRef();
+            if (!collectionRef) return;
+
+            try {
+                // Doc path: /artifacts/{appId}/users/{userId}/tasks/{taskId}
+                const docRef = doc(collectionRef, taskId);
+                await updateDoc(docRef, { completed: !isCompleted });
+            } catch (error) {
+                console.error("Error toggling task: ", error);
+            }
+        }
+
+        async function deleteTask(taskId) {
+            const collectionRef = getCollectionRef();
+            if (!collectionRef) return;
+
+            try {
+                // Doc path: /artifacts/{appId}/users/{userId}/tasks/{taskId}
+                const docRef = doc(collectionRef, taskId);
+                await deleteDoc(docRef);
+            } catch (error) {
+                console.error("Error deleting task: ", error);
+            }
+        }
+
+
+        // --- REAL-TIME DATA LISTENER AND RENDERING ---
+
+        function loadTasks() {
+            const collectionRef = getCollectionRef();
+            if (!collectionRef) return;
+
+            // Create a query to order tasks by creation time (newest first)
+            const tasksQuery = query(collectionRef, orderBy('createdAt', 'desc'));
+
+            // Set up real-time listener (onSnapshot)
+            onSnapshot(tasksQuery, (snapshot) => {
+                tasksList.innerHTML = ''; // Clear current list
+                loadingIndicator.classList.add('hidden');
+
+                if (snapshot.empty) {
+                    tasksList.innerHTML = '<p class="text-center text-gray-500 p-8">You have no tasks! Start by adding one above.</p>';
+                    return;
+                }
+
+                snapshot.forEach((doc) => {
+                    const task = doc.data();
+                    const taskId = doc.id;
+                    createTaskElement(taskId, task.text, task.completed);
+                });
+            }, (error) => {
+                console.error("Error fetching tasks:", error);
+                tasksList.innerHTML = `<p class="text-center text-red-500 p-8">Error loading tasks: ${error.message}</p>`;
+            });
+        }
+
+        // --- UI RENDERING HELPER ---
+
+        function createTaskElement(id, text, completed) {
+            const taskDiv = document.createElement('div');
+            taskDiv.id = `task-${id}`;
+            taskDiv.className = 'flex items-center justify-between bg-white p-4 rounded-xl shadow-md transition duration-150 hover:shadow-lg';
+
+            const textClass = completed ? 'task-done' : 'text-gray-800';
+
+            taskDiv.innerHTML = `
+                <div class="flex items-center min-w-0 flex-grow mr-4">
+                    <input
+                        type="checkbox"
+                        id="check-${id}"
+                        ${completed ? 'checked' : ''}
+                        class="h-5 w-5 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500 cursor-pointer"
+                        data-id="${id}"
+                        data-completed="${completed}"
+                    >
+                    <span class="ml-4 truncate ${textClass} text-base sm:text-lg font-medium">${text}</span>
+                </div>
+                <button
+                    data-id="${id}"
+                    class="delete-btn flex-shrink-0 ml-3 text-red-500 hover:text-red-700 p-2 rounded-full transition duration-150 hover:bg-red-50"
+                    title="Delete Task"
+                >
+                    <!-- Icon: Trash -->
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                        <path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm4 0a1 1 0 10-2 0v6a1 1 0 102 0V8z" clip-rule="evenodd" />
+                    </svg>
+                </button>
+            `;
+
+            tasksList.appendChild(taskDiv);
+
+            // Add event listeners to the new elements
+            taskDiv.querySelector('.delete-btn').addEventListener('click', (e) => {
+                deleteTask(id);
+            });
+            taskDiv.querySelector(`#check-${id}`).addEventListener('change', (e) => {
+                toggleTask(id, completed);
+            });
+        }
+
+
+        // --- EVENT LISTENERS ---
+
+        taskForm.addEventListener('submit', (e) => {
+            e.preventDefault();
+            const text = taskInput.value;
+            if (text) {
+                addTask(text);
+            }
+        });
+
+
+        // --- START APPLICATION ---
+        window.onload = setupFirebaseAndAuth;
+
+    </script>
+</body>
+</html>
